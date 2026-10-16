@@ -1,7 +1,9 @@
 import time
+import threading
 import numpy as np
 import requests
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Callable, Tuple
 
 from ict_market_structure import ICTMarketStructureEngine
@@ -10,6 +12,7 @@ from ict_market_structure import ICTMarketStructureEngine
 class GoldDataFeed:
     BASE_URL = "https://biquote.io"
     SYMBOL = "XAUUSD"
+    VALID_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
 
     def __init__(
         self,
@@ -18,7 +21,10 @@ class GoldDataFeed:
         engine: Optional[ICTMarketStructureEngine] = None,
         engine_kwargs: Optional[Dict[str, Any]] = None,
         request_timeout: float = 10.0,
+        error_log_size: int = 100,
     ):
+        if interval not in self.VALID_INTERVALS:
+            raise ValueError(f"interval must be one of {sorted(self.VALID_INTERVALS)}")
         self.max_bars = int(max_bars)
         self.interval = interval
         self.request_timeout = float(request_timeout)
@@ -31,6 +37,24 @@ class GoldDataFeed:
         self._last_tick: Optional[Dict[str, Any]] = None
         self._last_state: Dict[str, Any] = {}
         self._running = False
+        self._errors: deque = deque(maxlen=int(error_log_size))
+        self._lock = threading.RLock()
+
+    def _record_error(self, kind: str, message: str) -> None:
+        with self._lock:
+            self._errors.append({
+                "time": datetime.now(timezone.utc).isoformat(),
+                "kind": kind,
+                "message": str(message)[:500],
+            })
+
+    def get_errors(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._errors)
+
+    def clear_errors(self) -> None:
+        with self._lock:
+            self._errors.clear()
 
     def _push(self, o: float, h: float, l: float, c: float) -> None:
         self._buffer[self._write_idx, 0] = o
@@ -114,11 +138,7 @@ class GoldDataFeed:
         if arrs is None or len(arrs) < 2:
             self._last_state = self.engine.analyze(np.array([], dtype=np.float64))
             return self._last_state
-        o = arrs[:, 0]
-        h = arrs[:, 1]
-        l = arrs[:, 2]
-        c = arrs[:, 3]
-        self._last_state = self.engine.analyze((o, h, l, c))
+        self._last_state = self.engine.analyze((arrs[:, 0], arrs[:, 1], arrs[:, 2], arrs[:, 3]))
         return self._last_state
 
     def step(self, lookback_bars: int = 10) -> Tuple[int, Dict[str, Any], Dict[str, Any]]:
@@ -140,8 +160,10 @@ class GoldDataFeed:
                 new_bars, tick, state = self.step(lookback_bars)
                 if on_update is not None:
                     on_update(new_bars, tick, state)
-            except requests.RequestException:
-                pass
+            except requests.RequestException as e:
+                self._record_error("network", str(e))
+            except Exception as e:
+                self._record_error("runtime", str(e))
             time.sleep(poll_seconds)
 
     def stop(self) -> None:
