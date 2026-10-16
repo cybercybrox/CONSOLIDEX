@@ -1,3 +1,4 @@
 numpy>=1.24
 numba>=0.58
 requests>=2.31
+python-telegram-bot[job-queue]>=21.0
